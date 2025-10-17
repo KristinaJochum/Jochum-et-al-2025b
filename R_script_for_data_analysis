@@ -1,0 +1,477 @@
+#R script for data analysis
+#For each sample, CTs of two technical replicates were averaged and ΔCT was calculated according to Schmittgen and Livak 2008 by subtracting the mean CT of two control genes from the CT of the gene of interest, thus correcting for PCR variability. 
+
+#locate dataset repository
+setwd()
+#import dataset
+dat <- read_csv("Gene_expression_data.csv", sep = ";")
+
+#libraries:
+library(brms)
+library(bayesplot)
+library(bayestestR)
+library(ggplot2)
+library(ggtext)
+library(rstan)
+library(rstudioapi)
+library(emmeans)
+library(ggh4x)
+library(patchwork)
+
+#function:
+#graph for comparison
+comp_graph <- function(comparison, ylab, save){
+  comp <- as.data.frame(comparison[, 1:2])
+  comp$name <- c(gsub("^m_", "", row.names(comparison)))
+  comp$name <- gsub("_crit", "", comp$name)
+  comp$name <- gsub("_D", "", comp$name)
+  comp$name <- factor(comp$name, levels = comp$name[order(comp$elpd_diff)])
+  plot <- ggplot(data = comp, aes(x = elpd_diff, y = name))+
+    geom_point(stat = "identity")+
+    geom_errorbarh(
+      aes(
+        xmin = elpd_diff + se_diff,
+        xmax= elpd_diff - se_diff,
+        y = name
+      ),
+      height = 0
+    )+
+    geom_vline(aes(xintercept = 0))+
+    labs(x = "elpd difference", y = "Model")+
+    scale_y_discrete(labels = ylab)+
+    theme(
+      axis.text.y = element_markdown(hjust = 1, size = 12),
+      axis.text.x = element_text(size = 12),
+      axis.title.x = element_text(size = 14),
+      axis.title.y = element_text(size = 14)
+    )
+  print(plot)
+  if(save != "NO"){
+    ggsave(save, height = 15, width = 30, units = "cm", dpi = 1200)
+  }
+}
+
+#by gene plots for all 2way interactions
+plot_per_gene <- function(dam, met, cou, tim, I1, I2, col1, col2, x_lab, legend_title, save){
+  cXt <- data.frame(damage=character(0),cultivation_method=character(0),countcat=character(0),timepoint=character(0), gene = character(0), mean = numeric(0), CI_low = numeric(0), CI_high = numeric(0))
+  for(i in unique(d$gene)){
+    p=brms::posterior_epred(m_all2way,newdata=data.frame(damage=dam,cultivation_method=met,countcat=cou,timepoint=tim,gene=rep(i,length(dam))),ndraws=1000)
+    p_m=apply((-1)*p,2,mean)
+    p_HPDI=apply((-1)*p,2,hdi)
+    gene_df <- data.frame(damage = dam, cultivation_method = met, countcat = cou, timepoint = tim, gene = rep(i, length(dam)), mean = p_m, CI_low = sapply(p_HPDI, function(x) x$CI_low), CI_high = sapply(p_HPDI, function(x) x$CI_high))
+    cXt <- rbind(cXt, gene_df)
+  }
+  if(I1 == "countcat"){
+    cXt$countcat <- factor(cXt$countcat, levels = c("very low", "low","recommended","high","very high"))
+  }
+  cXt$damage <- ifelse(cXt$damage == "0", "undamaged", "damaged")
+  cXt$damage <- factor(cXt$damage, levels = c("undamaged", "damaged"))
+  cXt$timepoint <- ifelse(cXt$timepoint == "0", "0", "2")
+  cXt$cultivation_method <- factor(cXt$cultivation_method, levels = c("0", "1"), labels = c("normal-density", "high-density"))
+  #ggplot
+  plot <- ggplot(data = cXt, aes(x = .data[[I1]], y = .data[["mean"]], colour = .data[[I2]]))+
+    geom_point(stat = "identity", size = 1.8, position = position_dodge(width = 0.3))+
+    geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0, linewidth = 0.9, position = position_dodge(width = 0.3))+
+    #geom_line(aes(x = countcat, y = mean, colour = timepoint, group = timepoint), position = position_dodge(width = 0.2), linewidth = 1)+
+    facet_wrap(~gene, scales = "free_y", nrow = 2)+
+    scale_y_continuous(breaks = seq(-13, 13, by = 0.5))+
+    labs(x = x_lab, y = expression(-Delta*c[T]))+
+    scale_colour_manual(values = c(col1, col2), name = legend_title)+
+    theme_bw()+
+    theme(
+      legend.position = "bottom",
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 10),
+      legend.margin = margin(-10, 0, 0, 0)
+    )
+  print(plot)
+  if(save != "NO"){
+    ggsave(filename = save, dpi = 900, width = 21, height = 14.5, units = "cm")
+  }
+  return(cXt)
+}
+
+#data anlysis
+#exclude obvious outliers
+plot(dat$deltaCt)
+tail(sort(dat$deltaCt))
+d <- dat[dat$deltaCt < 13,] 
+
+#make parameters factors
+d$timepoint <- as.factor(d$timepoint)
+d$cultivation_method <- as.factor(d$cultivation_method)
+d$damage <- as.factor(d$damage)
+d$gene <- as.factor(d$gene)
+
+#make cell number categorical
+d$countcat <- ifelse((d$cultivation_method==0 & d$cell_amount==0.0052)|(d$cultivation_method==1 & d$cell_amount==0.13),"very low",ifelse((d$cultivation_method==0 & d$cell_amount==0.026)|(d$cultivation_method==1 & d$cell_amount==0.325),"low",ifelse((d$cultivation_method==0 & d$cell_amount==0.13)|(d$cultivation_method==1 & d$cell_amount==0.65),"recommended",ifelse((d$cultivation_method==0 & d$cell_amount==0.65)|(d$cultivation_method==1 & d$cell_amount==1.3),"high","very high"))))
+
+d$countcat <- factor(d$countcat, levels = c("recommended", "very low", "low", "high", "very high"))
+
+#set priors for brms modelling
+prior1 <- c(prior(normal(3,2), class = "Intercept"),
+            prior(normal(0,1), class = "b"),
+            prior(cauchy(0,2), class = "sd"),
+            prior(normal(0,2), class = "sigma")
+			)
+
+#model with the two hypothesized three-way interactions: cellnumber*damage*timepoint +  damage*timepoint*cultivation method
+m_two3way <- brm(deltaCt ~ 1 + countcat*damage*timepoint +  damage*timepoint*cultivation_method + (1 + countcat*damage*timepoint +  damage*timepoint*cultivation_method||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_two3way <- add_criterion(m_two3way,  c("waic","loo")) 
+
+#model checks
+pp_check(m_two3way)
+pp_check(m_two3way,type="stat",stat="mean")
+pp_check(m_two3way,type="stat_grouped",group="gene")
+pp_check(m_two3way,type="dens_overlay_grouped",group="gene")
+pp_check(m_two3way,type="scatter_avg_grouped",group="gene")
+plot(m_two3way)
+pairs(m_two3way,variable=variables(m_two3way)[1:5])
+pairs(m_two3way,variable=variables(m_two3way)[6:10])
+
+#plot full posterior distributions of coefficients
+posterior <- as.matrix(m_two3way)
+mcmc_areas(posterior,
+           pars=variables(m_two3way)[2:10], #2:10 exlcudes intercept so that the plot is more easily interpretable
+           # arbitrary threshold for shading probability mass
+           prob = 0.95) 
+
+#only cellnumer*damage*timepoint, other three-way as two-way  
+m_3way_cXdXt <- brm(deltaCt ~ 1 + countcat*damage*timepoint +  damage*timepoint + damage*cultivation_method + timepoint*cultivation_method + (1 + countcat*damage*timepoint +  damage*timepoint + damage*cultivation_method + timepoint*cultivation_method||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_3way_cXdXt <- add_criterion(m_3way_cXdXt,  c("waic","loo")) 
+
+#only damage*timepoint*cultivation_method, other three-way as two-way  
+m_3way_dXtXm <- brm(deltaCt ~ 1 + damage*timepoint +  countcat*timepoint +  countcat*damage +  damage*timepoint*cultivation_method + (1 + damage*timepoint +  countcat*timepoint +  countcat*damage +  damage*timepoint*cultivation_method||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_3way_dXtXm <- add_criterion(m_3way_dXtXm,  c("waic","loo"))
+
+#all two-way interactions resulting from the two hypothesized three-way interactions
+m_all2way <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+##make new for added criterion, because add_criterion messes up posterior_epred
+m_all2way_crit <- add_criterion(m_all2way, c("waic","loo"))
+
+#compare three-way models with two-way models 
+comp_3way <- loo_compare(m_two3way, m_3way_cXdXt, m_3way_dXtXm,  m_all2way_crit, criterion = "loo")
+
+#graph for comparison of three-way models with two-way models 
+comp_graph(comp_3way, ylab = c("all2way" = "<b>all two-way interactions</b><br>damage:timepoint<br>timepoint:cultivation method<br>damage:cultivation method<br>damage:cell number<br>timepoint:cell number", "3way_dXtXm" = "<b>three-way interaction</b><br>damage:timepoint:cultivation method", "3way_cXdXt" = "<b>three-way interaction</b><br>cell number:damage:timepoint", "two3way" = "<b>two three-way interactions</b><br>damage:timepoint:cultivation method<br>cell number:damage:timepoint"), save = "Sup_Fig_3.tiff")
+
+#exclude one 2way interaction at the time
+#without cellnumber*damage
+m_nocXd <- brm(deltaCt ~ 1  + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1  + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_nocXd <- add_criterion(m_nocXd, c("loo","waic"))
+
+#without cellnumber*timepoint
+m_nocXt <- brm(deltaCt ~ 1 +  countcat*damage + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1 + countcat*damage + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_nocXt <- add_criterion(m_nocXt, c("loo","waic"))
+
+#without damage*timepoint
+m_nodXt <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1 + countcat*damage + countcat*timepoint  +  timepoint*cultivation_method + damage*cultivation_method||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_nodXt <- add_criterion(m_nodXt, c("loo","waic"))
+
+#without timepoint*cultivation method
+m_notXm <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint + damage*timepoint +   damage*cultivation_method + (1 + countcat*damage + countcat*timepoint + damage*timepoint  + damage*cultivation_method||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_notXm <- add_criterion(m_notXm, c("loo","waic"))
+
+#without damage*cultivation method
+m_nodXm <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method  + (1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method ||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_nodXm <- add_criterion(m_nodXm, c("loo","waic"))	
+
+#only cellcount*timepoint 2-way
+m_2way_cXt <- brm(deltaCt ~ 1 + damage + countcat*timepoint + cultivation_method  + (1 + damage + countcat*timepoint + cultivation_method ||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_2way_cXt <- add_criterion(m_nodXm, c("loo","waic"))	
+
+#no interactions
+m_simple <- brm(deltaCt ~ 1 + countcat + damage +timepoint + cultivation_method  + (1 + countcat + damage + timepoint + cultivation_method ||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_simple <- add_criterion(m_simple, c("loo","waic"))
+
+#intercepts only model for all 2way
+m_all2way_io <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1 ||gene),data=d,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_all2way_io <- add_criterion(m_all2way_io, c("loo","waic"))
+
+#compare all two-way models
+comp_2way_cXt <- loo_compare(m_2way_cXt, m_all2way_crit, m_nocXd, m_nocXt, m_nodXt, m_notXm, m_nodXm, m_simple, criterion = "loo")
+
+#include intercepts-only model in comparison
+comp_2way_cXt_io <- loo_compare(m_2way_cXt, m_two3way, m_all2way_crit, m_nocXd, m_nocXt, m_nodXt, m_notXm, m_nodXm, m_simple, m_all2way_io, criterion = "loo")
+
+#graph for comparison of the two-way models without the intercepts-only model
+comp_graph(comp_2way_cXt, ylab = c("nocXd" = "all two-way interactions<br><b>without cell number:damage</b>", "all2way" = "<b>all two-way interactions", "nodXt" = "all two-way interactions<br><b>without damage:timepoint</b>", "notXm" = "all two-way interactions<br><b>without timepoint:cultivation method</b>", "nodXm" = "all two-way interactions<br><b>without damage:cultivation method</b>", "2way_cXt" = "<b>one two-way interaction</b><br>cell number:timepoint", "nocXt" = "all two-way interations<br><b>without cell number:timepoint</b>", "simple" = "<b>without two-way interactions"), save = "Sup_Fig_4.tiff")
+
+pp_check(m_all2way)
+pp_check(m_all2way,type="stat",stat="mean")
+check_stat_grouped <- pp_check(m_all2way,type="stat_grouped",group="gene")
+pp_check(m_all2way,type="dens_overlay_grouped",group="gene")
+#save for publication: supplementary figure
+ggsave(filename = "dens_overly_grouped.png", height = 15, width = 30, units = "cm", dpi = 900)
+pp_check(m_all2way,type="scatter_avg_grouped",group="gene") #predicted vs. observed
+plot(m_all2way)
+pairs(m_all2way,variable=variables(m_all2way)[1:5])
+pairs(m_all2way,variable=variables(m_all2way)[6:10])
+
+#plot full posterior distributions of coefficients
+posterior <- as.matrix(m_all2way)
+mcmc_areas(posterior,
+           pars=variables(m_all2way)[2:19], #2:10 exlcudes intercept so that the plot ismore easily interpretable
+           # arbitrary threshold for shading probability mass
+           prob = 0.95) 
+
+#by gene plots for all two-way interactions
+#cellnumber*timepoint
+plot_per_gene(dam = rep(levels(d$damage)[1],10), met = rep(levels(d$cultivation_method)[1],10),cou = rep(c("very low", "low","recommended","high","very high"),2), tim = rep(c(levels(d$timepoint)[1],levels(d$timepoint)[2]),each=5), I1 = "countcat", I2 = "timepoint", col1 = "lightgreen", col2 = "darkgreen", x_lab = "Cell number", legend_title = "Timepoint", save = "cXt.tiff")
+
+#cellnumber*damage
+plot_per_gene(dam = rep(c(levels(d$damage)[1], levels(d$damage)[2]), each=5), met = rep(levels(d$cultivation_method)[1],10),cou = rep(c("very low", "low","recommended","high","very high"),2), tim = rep(levels(d$timepoint)[1],10), I1 = "countcat", I2 = "damage", col1 = "lightblue", col2 = "darkblue", x_lab = "cell number", legend_title = "Damage", save = "cXd.png")
+
+#damage*cultivation method
+plot_per_gene(dam = rep(c(levels(d$damage)[1], levels(d$damage)[2]), each=2), met = rep(c(levels(d$cultivation_method)[1],levels(d$cultivation_method)[2]), 2),cou = rep(levels(d$countcat)[1],4), tim = rep(levels(d$timepoint)[1],4), I1 = "cultivation_method", I2 = "damage", col1 = "lightblue", col2 = "darkblue", x_lab = "Cultivation method", legend_title = "Damage", save = "NO")
+
+#timepoint*cultivation method
+plot_per_gene(dam = rep(levels(d$damage)[1], 4), met = rep(c(levels(d$cultivation_method)[1],levels(d$cultivation_method)[2]), 2),cou = rep(levels(d$countcat)[1],4), tim = rep(c(levels(d$timepoint)[1],levels(d$timepoint)[2]),each=2), I1 = "cultivation_method", I2 = "timepoint", col1 = "lightgreen", col2 = "darkgreen", x_lab = "Cultivation method", legend_title = "Timepoint", save = "NO")
+
+#damage*timepoint
+plot_per_gene(dam = rep(c(levels(d$damage)[1], levels(d$damage)[2]), 2), met = rep(levels(d$cultivation_method)[1], 4),cou = rep(levels(d$countcat)[1],4), tim = rep(c(levels(d$timepoint)[1],levels(d$timepoint)[2]), each=2), I1 = "damage", I2 = "timepoint", col1 = "lightgreen", col2 = "darkgreen", x_lab = "", legend_title = "Timepoint", save ="NO")
+
+
+
+
+#exclude CYP1A1, CYP1A2, CYP27A1 from the dataset
+D <- d[!(d$gene %in% c("CYP1A1", "CYP1A2", "CYP27A1")), ]
+D$gene <- droplevels(D$gene)
+
+#start from all two-way interactions resulting from the three-way interactions
+#all two-way interactions
+m_all2way_D <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method||gene),data=D,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+##make new for added criterion, because add_criterion messes up posterior_epred
+m_all2way_crit_D <- add_criterion(m_all2way_D, c("waic","loo"))
+
+#exclude one two-way interaction at the time
+#without cellnumber*damage
+m_nocXd_D <- brm(deltaCt ~ 1  + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1  + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method||gene),data=D,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_nocXd_D <- add_criterion(m_nocXd_D, c("loo","waic"))
+
+#without cellnumber*timepoint
+m_nocXt_D <- brm(deltaCt ~ 1 +  countcat*damage + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1 + countcat*damage + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method||gene),data=D,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_nocXt_D <- add_criterion(m_nocXt_D, c("loo","waic"))
+
+#without damage*timepoint
+m_nodXt_D <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1 + countcat*damage + countcat*timepoint  +  timepoint*cultivation_method + damage*cultivation_method||gene),data=D,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_nodXt_D <- add_criterion(m_nodXt_D, c("loo","waic"))
+
+#without timepoint*cultivation method
+m_notXm_D <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint + damage*timepoint +   damage*cultivation_method + (1 + countcat*damage + countcat*timepoint + damage*timepoint  + damage*cultivation_method||gene),data=D,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_notXm_D <- add_criterion(m_notXm_D, c("loo","waic"))
+
+#without damage*cultivation method
+m_nodXm_D <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method  + (1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method ||gene),data=D,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_nodXm_D <- add_criterion(m_nodXm_D, c("loo","waic"))	
+
+#only cellcount*timepoint 2-way
+m_2way_cXt_D <- brm(deltaCt ~ 1 + damage + countcat*timepoint + cultivation_method  + (1 + damage + countcat*timepoint + cultivation_method ||gene),data=D,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_2way_cXt_D <- add_criterion(m_nodXm_D, c("loo","waic"))	
+
+#no interaction
+m_simple_D <- brm(deltaCt ~ 1 + countcat + damage +timepoint + cultivation_method  + (1 + countcat + damage + timepoint + cultivation_method ||gene),data=D,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_simple_D <- add_criterion(m_simple_D, c("loo","waic"))
+
+#intercepts only
+m_all2way_io_D <- brm(deltaCt ~ 1 + countcat*damage + countcat*timepoint + damage*timepoint +  timepoint*cultivation_method + damage*cultivation_method + (1 ||gene),data=D,family=student(link="identity"),prior=prior2,cores=4,iter=4000,warmup=2000,chains=4)
+
+#add criterion for model comparison
+m_all2way_io_D <- add_criterion(m_all2way_io_D, c("loo","waic"))
+
+#compare all models (for graph without intercepts-only model)
+comp_2way_cXt_D <- loo_compare(m_2way_cXt_D, m_all2way_crit_D, m_nocXd_D, m_nocXt_D, m_nodXt_D, m_notXm_D, m_nodXm_D, m_simple_D, criterion = "loo")
+
+#comparison including the intercepts-only models
+comp_2way_cXt_io_D <- loo_compare(m_2way_cXt_D, m_all2way_crit_D, m_nocXd_D, m_nocXt_D, m_nodXt_D, m_notXm_D, m_nodXm_D, m_simple_D, m_all2way_io_D, criterion = "loo")
+
+comp_graph(comp_2way_cXt_D, ylab = c("nocXd" = "all two-way interactions<br><b>without cell number:damage</b>", "all2way" = "<b>all two-way interactions", "nodXt" = "all two-way interactions<br><b>without damage:timepoint</b>", "notXm" = "all two-way interactions<br><b>without timepoint:cultivation method</b>", "nodXm" = "all two-way interactions<br><b>without damage:cultivation method</b>", "2way_cXt" = "<b>one two-way interaction</b><br>cell number:timepoint", "nocXt" = "all two-way interations<br><b>without cell number:timepoint</b>", "simple" = "<b>without two-way interactions"), save = "comp_2_way_D.png")
+
+#model checks
+pp_check(m_all2way_D)
+pp_check(m_all2way_D,type="stat",stat="mean")
+pp_check(m_all2way_D,type="stat_grouped",group="gene")
+pp_check(m_all2way_D,type="dens_overlay_grouped",group="gene")
+pp_check(m_all2way_D,type="scatter_avg_grouped",group="gene") #predicted vs. observed
+plot(m_all2way_D)
+pairs(m_all2way_D,variable=variables(m_all2way_D)[1:5])
+pairs(m_all2way_D,variable=variables(m_all2way_D)[6:10])
+
+#plot full posterior distributions of coefficients
+posterior_D <- as.matrix(m_all2way_D)
+mcmc_areas(posterior_D,
+           pars=variables(m_all2way_D)[2:19], #2:10 exlcudes intercept so that the plot is more easily interpretable
+           # arbitrary threshold for shading probability mass
+           prob = 0.95) 
+
+
+#global plot with emmeans
+#calculate contrasts for each interaction (both ways), other parameters are set to their reference level
+#damage*cultivation method
+dXm_emmeans <- emmeans(m_all2way_D, specs = "damage", by="cultivation_method", at = list(timepoint = "0", countcat = "recommended"), epred = T, re_formula = NA, contr = "pairwise")
+dXm_emmeans_df <- as.data.frame(dXm_emmeans)[5:6,] #extract emmeans and HPDs
+dXm_emmeans_df <- cbind("parameter" = c(rep("cultivation\nmethod", 2)), "value" = ifelse(dXm_emmeans_df[,1] == "0", "normal-density", "high-density"), dXm_emmeans_df[, 3:6]) #add parameter column and correct name of cultivation method
+
+#cultivation method*damage
+mXd_emmeans <- emmeans(m_all2way_D, specs = "cultivation_method", by="damage", at = list(timepoint = "0", countcat = "recommended"), epred = T, re_formula = NA, contr = "pairwise")
+mXd_emmeans_df <- as.data.frame(mXd_emmeans)[5:6,] #extract emmeans and HPDs
+mXd_emmeans_df <- cbind("parameter" = c(rep("damage", 2)), "value" = ifelse(mXd_emmeans_df[,1] == "0", "undamaged", "damaged"), mXd_emmeans_df[, 3:6]) #add parameter column and correct name of damage
+
+#damage*timepoint
+dXt_emmeans <- emmeans(m_all2way_D, specs = "timepoint", by="damage", at = list(cultivation_method = "0", countcat = "recommended"), epred = T, re_formula = NA, contr = "pairwise")
+dXt_emmeans_df <- as.data.frame(dXt_emmeans)[5:6,] #extract emmeans and HPDs
+dXt_emmeans_df <- cbind("parameter" = c(rep("damage", 2)), "value" = ifelse(dXt_emmeans_df[,1] == "0", "undamaged", "damaged") ,dXt_emmeans_df[, 3:6]) #add parameter column and correct name of damage
+
+#timepoint*damage
+tXd_emmeans <- emmeans(m_all2way_D, specs = "damage", by="timepoint", at = list(cultivation_method = "0", countcat = "recommended"), epred = T, re_formula = NA, contr = "pairwise")
+tXd_emmeans_df <- as.data.frame(tXd_emmeans)[5:6,] #extract emmeans and HPDs
+tXd_emmeans_df <- cbind("parameter" = c(rep("timepoint", 2)), "value" = ifelse(tXd_emmeans_df[,1] == "0", "timepoint 0", "timepoint 2") ,tXd_emmeans_df[, 3:6]) #add parameter column and correct name of timepoint
+
+#timepoint*cultivation method
+tXm_emmeans <- emmeans(m_all2way_D, specs = "timepoint", by="cultivation_method", at = list(damage = "0", countcat = "recommended"), epred = T, re_formula = NA, contr = "pairwise")
+tXm_emmeans_df <- as.data.frame(tXm_emmeans)[5:6,] #extract emmeans and HPDs
+tXm_emmeans_df <- cbind("parameter" = c(rep("cultivation\nmethod", 2)), "value" = ifelse(tXm_emmeans_df[,1] == "0", "normal-density", "high-density"), tXm_emmeans_df[, 3:6]) #add parameter column and correct name of cultivation method
+
+#cultivation method*timepoint
+mXt_emmeans <- emmeans(m_all2way_D, specs = "cultivation_method", by="timepoint", at = list(damage = "0", countcat = "recommended"), epred = T, re_formula = NA, contr = "pairwise")
+mXt_emmeans_df <- as.data.frame(mXt_emmeans)[5:6,] #extract emmeans and HPDs
+mXt_emmeans_df <- cbind("parameter" = c(rep("timepoint", 2)), "value" = ifelse(mXt_emmeans_df[,1] == "0", "timepoint 0", "timepoint 2"), mXt_emmeans_df[, 3:6]) #add parameter column and correct name of timepoint
+
+#cellnumber*damage
+cXd_emmeans <- emmeans(m_all2way_D, specs = "damage", by="countcat", at = list(cultivation_method = "0", timepoint = "0"), epred = T, re_formula = NA, contr = "pairwise")
+cXd_emmeans_df <- as.data.frame(cXd_emmeans)[11:15,] #extract emmeans and HPDs
+cXd_emmeans_df <- cbind("parameter" = c(rep("cell number", 5)), "value" = cXd_emmeans_df[,1], cXd_emmeans_df[, 3:6]) #add parameter column and correct name of cellnumber
+
+#damage*cellnumber
+dXc_emmeans <- emmeans(m_all2way_D, specs = "countcat", by="damage", at = list(cultivation_method = "0", timepoint = "0"), epred = T, re_formula = NA, contr = "pairwise")
+dXc_emmeans_df <- as.data.frame(dXc_emmeans)[11:30,] #extract emmeans and HPDs
+dXc_emmeans_df <- cbind("parameter" = c(rep("damage", 20)), "value" = ifelse(dXc_emmeans_df[,1] == "0", "undamaged", "damaged"), dXc_emmeans_df[, 3:6]) #add parameter column and correct name of damage
+dXc_emmeans_df <- dXc_emmeans_df[c(grep("recommended", dXc_emmeans_df$contrast)),] #only comparisons with the recommended cell number
+
+#cellnumber*timepoint
+cXt_emmeans <- emmeans(m_all2way_D, specs = "timepoint", by="countcat", at = list(cultivation_method = "0", damage = "0"), epred = T, re_formula = NA, contr = "pairwise")
+cXt_emmeans_df <- as.data.frame(cXt_emmeans)[11:15,] #extract emmeans and HPDs
+cXt_emmeans_df <- cbind("parameter" = c(rep("cell number", 5)), "value" = cXt_emmeans_df[,1] ,cXt_emmeans_df[, 3:6]) #add parameter column and correct name of cellnumber
+
+#timepoint*cellnumber
+tXc_emmeans <- emmeans(m_all2way_D, specs = "countcat", by="timepoint", at = list(cultivation_method = "0", damage = "0"), epred = T, re_formula = NA, contr = "pairwise")
+tXc_emmeans_df <- as.data.frame(tXc_emmeans)[11:30,] #extract emmeans and HPDs
+tXc_emmeans_df <- cbind("parameter" = c(rep("timepoint", 20)), "value" = ifelse(tXc_emmeans_df[,1] == "0", "timepoint 0", "timepoint 2") ,tXc_emmeans_df[, 3:6]) #add parameter column and correct name of timepoint
+tXc_emmeans_df <- tXc_emmeans_df[c(grep("recommended", tXc_emmeans_df$contrast)),] #only comparisons with the recommended cell number
+
+#put in one df
+df <- rbind(cXt_emmeans_df,tXc_emmeans_df, cXd_emmeans_df, dXc_emmeans_df, tXm_emmeans_df, mXt_emmeans_df, dXt_emmeans_df,tXd_emmeans_df, dXm_emmeans_df, mXd_emmeans_df)
+
+#set value as factor
+df$value <- factor(df$value, levels = c("damaged", "undamaged", "high-density", "normal-density", "timepoint 2", "timepoint 0", "very high", "high", "recommended", "low", "very low"))
+
+#set contrast as factor
+df$contrast <- factor(df$contrast, levels = rev(c("damage0 - damage1", "timepoint0 - timepoint1", "cultivation_method0 - cultivation_method1", "recommended - very high" , "recommended - high", "recommended - low", "recommended - very low")))
+
+#change names of levels of contrast
+levels(df$contrast) <- rev(c("damaged", "timepoint 2", "high-density cultivation method", "very high cell number" , "high cell number", "low cell number", "very low cell number"))
+
+#split df for plotting
+df1 <- df[-c(grep("damaged", df$contrast), grep("timepoint 2", df$contrast)),]
+df2 <- df[c(grep("damaged", df$contrast), grep("timepoint 2", df$contrast)),]
+
+#plot first part
+df1_plot <- ggplot(data = df1, aes(x = value, y = emmean, color = parameter))+
+  geom_hline(aes(yintercept = 0))+ 
+  geom_hline(aes(yintercept = -1), linetype = "dashed")+ 
+  geom_hline(aes(yintercept = 1), linetype = "dashed")+ 
+  geom_point(stat = "identity", size = 1.8)+ 
+  geom_errorbar(aes(ymin = lower.HPD, ymax = upper.HPD), width = 0, linewidth = 0.9)+ 
+  scale_color_manual(values = c("cell number" = "grey", "cultivation\nmethod" = "pink", "timepoint" = "chartreuse3", "damage" = "deepskyblue2"))+ 
+  facet_wrap(~contrast, 
+              scales = "free_y", 
+              strip.position = "top", 
+              ncol = 1,
+             )+ 
+  ylab(NULL)+ 
+  scale_y_continuous(lim = c(-2,2), breaks = seq(-3, 2.5, by = 0.5))+ 
+  coord_flip()+
+  theme_bw()+
+  theme(
+    strip.text = element_markdown(size = 9),
+    axis.title.y = element_blank(),
+    legend.position = "none",
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    plot.margin = margin(0,0.5,0,0.5, unit = "cm"),
+    panel.spacing = unit(0.5, "cm")
+    )
+
+df1_plot
+
+#plot second part
+df2_plot <- ggplot(data = df2, aes(x = value, y = emmean, color = parameter))+
+  geom_hline(aes(yintercept = 0))+
+  geom_hline(aes(yintercept = -1), linetype = "dashed")+
+  geom_hline(aes(yintercept = 1), linetype = "dashed")+
+  geom_point(stat = "identity", size = 1.8)+
+  geom_errorbar(aes(ymin = lower.HPD, ymax = upper.HPD), width = 0, linewidth = 0.9)+
+  facet_wrap(~contrast, 
+              scales = "free_y", 
+              strip.position = "top", 
+             ncol = 1)+
+  ylab(expression(-Delta*c[T]*" difference compared to reference level"))+
+  scale_color_manual(values = c("cell number" = "grey", "cultivation\nmethod" = "pink", "timepoint" = "chartreuse3", "damage" = "deepskyblue2"))+
+  coord_flip()+
+  scale_y_continuous(lim = c(-2,2), breaks = seq(-3, 2.5, by = 0.5))+
+  theme_bw()+
+  theme(
+    strip.text = element_text(size = 9),
+    axis.title.y = element_blank(),
+    legend.position = "bottom",
+    plot.margin = margin(0.4,0.5,0.5,0.5, unit = "cm"),
+    panel.spacing = unit(0.5, "cm"),
+    axis.title.x = element_text(margin = margin(t = 10))
+  )+
+  guides(
+    color = guide_legend(title = "Parameter", nrow = 1))
+
+df2_plot
+
+#stack plots on top of each other
+df1_plot / df2_plot + plot_layout(heights = c(1.8,1), widths = c(1)) 
+
+#save plot
+ggsave("Fig_2.tiff", width = 14, height = 21,  units = "cm", dpi = 900)
