@@ -33,3 +33,5 @@ More information on statistical approach can be found in the supplementary mater
 
 ---------------------------------------------------------------------------------------
 This project is licensed under the terms of CC-BY-4.0.
+
+[![DOI](https://zenodo.org/badge/1054137728.svg)](https://doi.org/10.5281/zenodo.17380238)
